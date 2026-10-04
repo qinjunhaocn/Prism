@@ -72,50 +72,49 @@ class MainActivity : FlutterActivity() {
     /**
      * 枚举可用的存储卷。
      *
-     * 优先使用 [StorageManager.getStorageVolumes]（API 24+），拿到真实容量；
+     * 使用 [StorageManager.getStorageVolumes]（API 24+）拿到真实容量；
      * 失败时退回主共享存储与根目录。
+     *
+     * 注意：这里只能使用 `StorageVolume.getDirectory()`，不能使用
+     * `getPath()` —— 后者已在 API 36 的公开存根中被移除，用它会导致
+     * Kotlin 编译期报 `Unresolved reference`（与运行时版本无关，
+     * 因此用 SDK_INT 分支也无法规避）。
      */
     private fun listStorageVolumes(): List<Map<String, Any?>> {
         val volumes = mutableListOf<Map<String, Any?>>()
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            try {
-                val storageManager = getSystemService(StorageManager::class.java)
-                if (storageManager != null) {
-                    for (volume in storageManager.storageVolumes) {
-                        val directory = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                            volume.directory
-                        } else {
-                            @Suppress("DEPRECATION")
-                            volume.getPath()
-                        }
-                        val path = directory?.absolutePath ?: continue
-                        if (!directory.canRead()) continue
+        try {
+            val storageManager = getSystemService(StorageManager::class.java)
+            if (storageManager != null) {
+                for (volume in storageManager.storageVolumes) {
+                    // getDirectory() 自 API 24 起即可用，无需版本判断。
+                    val directory = volume.directory ?: continue
+                    if (!directory.canRead()) continue
+                    val path = directory.absolutePath
 
-                        var total = 0L
-                        var free = 0L
-                        try {
-                            total = directory.totalSpace
-                            free = directory.usableSpace
-                        } catch (_: Exception) {
-                            // 某些卷不支持查询容量，保持 0。
-                        }
-
-                        volumes.add(
-                            mapOf(
-                                "path" to path,
-                                "label" to volume.getDescription(this),
-                                "totalBytes" to total,
-                                "freeBytes" to free,
-                                "isPrimary" to volume.isPrimary,
-                                "isRemovable" to volume.isRemovable,
-                            )
-                        )
+                    var total = 0L
+                    var free = 0L
+                    try {
+                        total = directory.totalSpace
+                        free = directory.usableSpace
+                    } catch (_: Exception) {
+                        // 某些卷不支持查询容量，保持 0。
                     }
+
+                    volumes.add(
+                        mapOf(
+                            "path" to path,
+                            "label" to volume.getDescription(this),
+                            "totalBytes" to total,
+                            "freeBytes" to free,
+                            "isPrimary" to volume.isPrimary,
+                            "isRemovable" to volume.isRemovable,
+                        )
+                    )
                 }
-            } catch (_: Exception) {
-                // 落到下面的兜底逻辑。
             }
+        } catch (_: Exception) {
+            // 落到下面的兜底逻辑。
         }
 
         if (volumes.isEmpty()) {

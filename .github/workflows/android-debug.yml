@@ -1,0 +1,148 @@
+name: Build Debug APK
+
+# 仅手动触发：在 Actions 页面点 "Run workflow" 才会构建。
+on:
+  workflow_dispatch:
+
+# 同一分支上新的推送会取消仍在跑的旧构建，避免浪费额度。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # ---------------------------------------------------------------
+  # 版本锁定：必须与本地开发环境完全一致，否则容易出现
+  # 「本地能构建、CI 报错」或产物行为不一致的问题。
+  #
+  # 固定 Flutter 版本 = 同时固定了以下全部内容：
+  #   * Dart SDK              3.13.5（pubspec 要求 ^3.13.5）
+  #   * compileSdk            36
+  #   * targetSdk             36
+  #   * NDK                   28.2.13676358
+  #   * Gradle wrapper 模板   9.3.1
+  # 因为 compileSdk / targetSdk / NDK 都来自 Flutter SDK 自身，
+  # 而不是本仓库文件，所以只要 Flutter 版本一致，这些就一定一致。
+  #
+  # 另有三个版本来自本仓库文件，随代码一起生效，天然一致：
+  #   * Gradle  9.3.1   → android/gradle/wrapper/gradle-wrapper.properties
+  #   * AGP     9.1.0   → android/settings.gradle.kts
+  #   * Kotlin  2.4.0   → android/settings.gradle.kts
+  # ---------------------------------------------------------------
+  FLUTTER_VERSION: '3.47.6'
+  FLUTTER_CHANNEL: 'stable'
+  # 与 android/app/build.gradle.kts 的 sourceCompatibility / jvmTarget 保持一致。
+  JAVA_VERSION: '17'
+  # 与 android/app/build.gradle.kts 中 flutter.compileSdkVersion 解析结果一致。
+  ANDROID_COMPILE_SDK: '36'
+  # 与 flutter.ndkVersion 一致（见 FlutterExtension.kt）。
+  ANDROID_NDK_VERSION: '28.2.13676358'
+  # 刻意不锁定 build-tools 版本：该版本号由 AGP 9.1.0 内部决定，
+  # 写死一个猜测值反而会导致 sdkmanager 下载失败。交给 AGP 自行请求。
+
+jobs:
+  build-debug-apk:
+    name: 构建 debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # JDK 17：Gradle 9.x / AGP 9.x 要求，且与项目 Java 目标版本一致。
+      - name: 配置 JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      # 固定 Flutter 版本，并缓存 pub 依赖与 Flutter SDK，加速后续构建。
+      - name: 安装 Flutter ${{ env.FLUTTER_VERSION }}
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          cache: true
+
+      # 打印实际版本，便于在构建日志中核对是否与本地一致。
+      - name: 校验工具链版本
+        run: |
+          flutter --version
+          java -version
+          echo "---- 仓库内固定的构建版本 ----"
+          grep distributionUrl android/gradle/wrapper/gradle-wrapper.properties
+          grep -E 'com\.android\.application|kotlin\.android' android/settings.gradle.kts
+
+      # 显式安装 platform 36 与 NDK，避免 AGP 在构建时临时下载失败
+      # 导致的偶发报错（这是 CI 上最常见的「莫名其妙的问题」）。
+      # build-tools 不在此写死版本：其版本号由 AGP 9.1.0 内部决定，
+      # 交给 AGP 自行请求可避免版本猜错导致下载失败。
+      - name: 准备 Android SDK 组件
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$(command -v sdkmanager || echo "${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}/cmdline-tools/latest/bin/sdkmanager")"
+          echo "使用 sdkmanager: $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" \
+            "platform-tools" \
+            "platforms;android-${ANDROID_COMPILE_SDK}" \
+            "ndk;${ANDROID_NDK_VERSION}"
+          echo "ANDROID_HOME=${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+
+      - name: 拉取依赖
+        run: flutter pub get
+
+      # 静态分析：本项目要求零 issue，分析失败即视为构建失败。
+      - name: 静态分析
+        run: flutter analyze
+
+      - name: 运行测试
+        run: flutter test
+
+      # Gradle 依赖与构建缓存，重复构建时可显著缩短时间。
+      - name: 配置 Gradle 缓存
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: 构建 debug APK
+        run: flutter build apk --debug
+
+      - name: 显示产物信息
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="build/app/outputs/flutter-apk/app-debug.apk"
+          if [ ! -f "$APK" ]; then
+            echo "::error::未找到预期的 APK：$APK"
+            exit 1
+          fi
+          ls -lh "$APK"
+          echo "### Debug APK 构建成功" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 项目 | 值 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Flutter | ${FLUTTER_VERSION} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| JDK | ${JAVA_VERSION} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| compileSdk | ${ANDROID_COMPILE_SDK} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 包名 | com.voxyn.prism |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 大小 | $(du -h "$APK" | cut -f1) |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传 debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: prism-debug-apk
+          path: build/app/outputs/flutter-apk/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      # 构建失败时保留完整日志，便于定位问题。
+      - name: 失败时上传构建日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-build-logs
+          path: |
+            build/app/outputs/logs/**
+            android/.gradle/**
+          if-no-files-found: ignore
+          retention-days: 7
